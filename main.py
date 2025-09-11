@@ -9,9 +9,9 @@ from rich import box
 
 console = Console()
 CONFIG_FILE = "servers.json"
-VERSION = "v0.1.0"
+SESSIONS_FILE = "sessions.json"
+VERSION = "v0.1.1"
 
-# ядро: загрузка/сохранение серверов
 def load_servers():
     if not os.path.exists(CONFIG_FILE): return []
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -21,19 +21,24 @@ def save_servers(servers):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(servers, f, indent=2, ensure_ascii=False)
 
-# инфо: базовая статистика сервера
+def load_sessions():
+    if not os.path.exists(SESSIONS_FILE): return {}
+    with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_session(name, server, cwd):
+    sessions = load_sessions()
+    sessions[name] = {"host": server["host"], "user": server["user"], "cwd": cwd}
+    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2, ensure_ascii=False)
+
 def get_server_info(ssh):
-    cmds = [
-        "hostname", "uptime", "free -h", "df -h /",
-        "lscpu | grep 'Model name\\|CPU(s)'",
-        "cat /etc/os-release | grep PRETTY_NAME"
-    ]
+    cmds = ["hostname", "uptime", "free -h", "df -h /", "lscpu | grep 'Model name\\|CPU(s)'", "cat /etc/os-release | grep PRETTY_NAME"]
     console.print("\n[bold green]📊 Информация о системе:[/bold green]\n")
     for cmd in cmds:
         _, out, _ = ssh.exec_command(cmd)
         console.print(out.read().decode().strip())
 
-# настройка: первый запуск
 def setup_server(ssh, os_type):
     run = lambda c: ssh.exec_command(c)
     run("sudo apt update -y")
@@ -44,49 +49,68 @@ def setup_server(ssh, os_type):
     run("sudo apt update && sudo apt install -y catrobat || true")
     console.print("[green]✅ Настройка завершена[/green]")
 
-# интерфейс: красивая панель infovds
 def show_infovds(ssh):
     run = lambda c: ssh.exec_command(c)[1].read().decode().strip()
+    try:
+        cpu_model = run('lscpu | grep "Model name" | cut -d ":" -f2 | xargs') or "N/A"
+        cpu_cores = run('nproc') or "N/A"
+        mem_used = run('free -h | awk \'/Mem/ {print $3}\'') or "N/A"
+        mem_total = run('free -h | awk \'/Mem/ {print $2}\'') or "N/A"
+        disk = run('df -h / | tail -1 | awk \'{print $3" / "$2" ("$5")"}\'') or "N/A"
+        load = run("uptime | awk -F'load average:' '{print $2}'").strip() or "N/A"
+        ip = run("hostname -I | awk '{print $1}'") or "N/A"
+        os_name = run('cat /etc/os-release | grep PRETTY_NAME | cut -d \'"\' -f2') or "N/A"
+        hostname = run("hostname") or "N/A"
+    except: 
+        cpu_model = cpu_cores = mem_used = mem_total = disk = load = ip = os_name = hostname = "ERR"
+
     data = {
-        "Имя": run("hostname"),
-        "IP": run("hostname -I | awk '{print $1}'"),
-        "ОС": run("cat /etc/os-release | grep PRETTY_NAME | cut -d '\"' -f2"),
+        "Имя": hostname,
+        "IP": ip,
+        "ОС": os_name,
         "Аптайм": run("uptime -p"),
-        "ЦПУ": f"{run('lscpu | grep \"Model name\" | cut -d \":\" -f2 | xargs')} ({run('nproc')} ядер)",
-        "Память": f"{run('free -h | grep Mem | awk \"{print $3}\"')} / {run('free -h | grep Mem | awk \"{print $2}\"')}",
-        "Диск": run("df -h / | tail -1 | awk '{print $2\" / \"$3\" занято\"}'"),
-        "Нагрузка": run("uptime | awk -F'load average:' '{print $2}'")
+        "ЦПУ": f"{cpu_model} ({cpu_cores} ядер)",
+        "Память": f"{mem_used} / {mem_total}",
+        "Диск": disk,
+        "Нагрузка": load
     }
     t = Table.grid(padding=(0, 2))
     t.add_column(style="cyan", justify="right")
     t.add_column(style="green")
     for k, v in data.items(): t.add_row(f"🔹 {k}:", v)
-    console.print(Panel(t, title=f"[bold yellow]📊 {data['Имя']}[/bold yellow]", border_style="blue", box=box.ROUNDED))
+    console.print(Panel(t, title=f"[bold yellow]📊 {hostname}[/bold yellow]", border_style="blue", box=box.ROUNDED))
     console.print("[dim]→ Введите команду...[/dim]\n")
 
-# sftp: загрузка файла/папки
 def upload_item(sftp, local, remote):
     if os.path.isfile(local):
         console.print(f"📤 Загрузка: {local} → {remote}")
-        sftp.put(local, remote)
+        try:
+            sftp.put(local, remote)
+        except Exception as e:
+            console.print(f"[red]❌ Ошибка загрузки: {e}[/red]")
     elif os.path.isdir(local):
-        try: sftp.mkdir(remote)
+        try:
+            sftp.mkdir(remote)
         except: pass
         for item in os.listdir(local):
             l = os.path.join(local, item)
             r = f"{remote.rstrip('/')}/{item}"
             upload_item(sftp, l, r)
 
-# sftp: скачивание файла/папки
 def download_item(sftp, remote, local):
     try:
-        sftp.stat(remote)
-    except:
-        console.print(f"[red]❌ Удалённый путь не найден: {remote}[/red]")
+        attrs = sftp.stat(remote)
+    except Exception as e:
+        console.print(f"[red]❌ Удалённый путь не найден: {remote} ({e})[/red]")
         return
-    if '.' in os.path.basename(remote) or '/' not in remote:
+
+    if not attrs.st_mode & 0o040000:  # не директория
+        os.makedirs(os.path.dirname(local), exist_ok=True)
         console.print(f"📥 Скачивание: {remote} → {local}")
-        sftp.get(remote, local)
+        try:
+            sftp.get(remote, local)
+        except Exception as e:
+            console.print(f"[red]❌ Ошибка скачивания: {e}[/red]")
     else:
         os.makedirs(local, exist_ok=True)
         for item in sftp.listdir(remote):
@@ -96,10 +120,13 @@ def download_item(sftp, remote, local):
                 sftp.stat(r + "/")
                 download_item(sftp, r, l)
             except:
+                os.makedirs(os.path.dirname(l), exist_ok=True)
                 console.print(f"📥 Скачивание: {r} → {l}")
-                sftp.get(r, l)
+                try:
+                    sftp.get(r, l)
+                except Exception as e:
+                    console.print(f"[red]❌ Ошибка: {e}[/red]")
 
-# команда: обработка file
 def handle_file_cmd(ssh, args):
     if len(args) < 3:
         console.print("[red]❌ Использование: file <источник> <назначение>[/red]")
@@ -107,7 +134,7 @@ def handle_file_cmd(ssh, args):
     src, dst = args[1], args[2]
     try:
         sftp = ssh.open_sftp()
-        if src.startswith("./") or os.path.exists(src):
+        if os.path.exists(src):
             upload_item(sftp, src, dst)
             console.print("[green]✅ Загрузка завершена[/green]")
         else:
@@ -117,7 +144,6 @@ def handle_file_cmd(ssh, args):
     except Exception as e:
         console.print(f"[red]❌ Ошибка SFTP: {e}[/red]")
 
-# сессия: основной цикл
 def connect_to_server(server):
     try:
         ssh = paramiko.SSHClient()
@@ -127,12 +153,10 @@ def connect_to_server(server):
         real_host = out.read().decode().strip() or server["host"]
         server["real_hostname"] = real_host
 
-        # получаем начальную директорию
         _, out, _ = ssh.exec_command("pwd")
-        current_dir = out.read().decode().strip()
-        # укорачиваем: /home/user → user
-        short_dir = current_dir.split("/")[-1] if current_dir != "/" else ""
+        current_dir = out.read().decode().strip() or "/"
 
+        short_dir = current_dir.split("/")[-1] if current_dir != "/" else "~"
         console.print(f"[blue]✅ Подключено к {server['name']} → {real_host}[/blue]")
         get_server_info(ssh)
 
@@ -146,44 +170,56 @@ def connect_to_server(server):
                         s.update(server)
                 save_servers(servers)
 
-        console.print("\n[bold cyan]→ Команды: exit, infovds, file <источник> <назначение>[/bold cyan]")
+        console.print("\n[bold cyan]→ Команды: exit, infovds, file, clear, cls, cd, local ls[/bold cyan]")
 
-        # флаг: используем ли dash-стиль (# вместо $)
         use_dash_prompt = False
+        last_cwd = current_dir
 
         while True:
-            # формируем промпт: root@hostname/dir #
             prompt_symbol = "#" if use_dash_prompt else "$"
-            prompt_display = short_dir if short_dir else "~"
-            cmd = Prompt.ask(f"[green]{server['user']}@{real_host}/{prompt_display}[/green] {prompt_symbol} ")
+            prompt_display = last_cwd.split("/")[-1] if last_cwd != "/" else "~"
+            cmd = Prompt.ask(f"[green]{server['user']}@{real_host}/{prompt_display}[/green] {prompt_symbol} ").strip()
 
-            if cmd.strip() == "exit" or cmd.strip() == "quit":
+            if not cmd:
+                continue
+            elif cmd == "exit" or cmd == "quit":
                 break
-            elif cmd.strip() == "infovds":
+            elif cmd == "infovds":
                 show_infovds(ssh)
                 continue
-            elif cmd.strip() == "dash":
-                use_dash_prompt = True  # переключаем на # промпт
+            elif cmd == "dash":
+                use_dash_prompt = True
                 console.print("[dim]→ Переключён на dash-стиль промпта[/dim]")
                 continue
+            elif cmd == "clear" or cmd == "cls":
+                os.system('cls' if os.name == 'nt' else 'clear')
+                continue
             elif cmd.startswith("cd "):
-                # выполняем cd и обновляем текущую директорию
-                _, _, err = ssh.exec_command(cmd)
+                target = cmd[3:].strip() or "/"
+                full_cmd = f"cd {target} && pwd"
+                _, out, err = ssh.exec_command(full_cmd)
+                output = out.read().decode().strip()
                 error = err.read().decode().strip()
                 if error:
                     console.print(f"[red]{error}[/red]")
                 else:
-                    # обновляем short_dir
-                    _, out, _ = ssh.exec_command("pwd")
-                    current_dir = out.read().decode().strip()
-                    short_dir = current_dir.split("/")[-1] if current_dir != "/" else ""
+                    last_cwd = output
                 continue
             elif cmd.startswith("file "):
-                handle_file_cmd(ssh, cmd.split(" ", 2))
+                handle_file_cmd(ssh, cmd.split(" ", 3))
+                continue
+            elif cmd.startswith("local ls"):
+                path = cmd[8:].strip() or "."
+                try:
+                    items = os.listdir(path)
+                    for item in items:
+                        console.print(f"  {item}")
+                except Exception as e:
+                    console.print(f"[red]❌ local ls: {e}[/red]")
                 continue
 
-            # выполняем любую другую команду
-            _, out, err = ssh.exec_command(cmd)
+            full_cmd = f"cd {last_cwd} 2>/dev/null && {cmd}"
+            _, out, err = ssh.exec_command(full_cmd)
             output = out.read().decode()
             error = err.read().decode()
             if output:
@@ -193,10 +229,15 @@ def connect_to_server(server):
 
         ssh.close()
         console.print("[red]🔌 Отключено[/red]")
+
+        if Confirm.ask("[yellow]💾 Сохранить сессию?[/yellow]"):
+            sess_name = Prompt.ask("📁 Название сессии")
+            save_session(sess_name, server, last_cwd)
+            console.print(f"[green]✅ Сессия '{sess_name}' сохранена[/green]")
+
     except Exception as e:
         console.print(f"[red]❌ Ошибка подключения: {e}[/red]")
 
-# интерфейс: добавить сервер
 def add_server():
     name = Prompt.ask("Имя сервера")
     host = Prompt.ask("IP")
@@ -209,7 +250,6 @@ def add_server():
     save_servers(servers)
     console.print(f"[green]✅ Сервер {name} добавлен[/green]")
 
-# интерфейс: список серверов
 def list_servers():
     servers = load_servers()
     if not servers:
@@ -222,13 +262,37 @@ def list_servers():
         t.add_row(str(i), s["name"], s["host"], s["user"], s["os"], setup)
     console.print(t)
 
-# точка входа: главное меню
+def restore_session():
+    sessions = load_sessions()
+    if not sessions:
+        console.print("[yellow]Нет сохранённых сессий[/yellow]")
+        return None
+    t = Table(title="Сессии")
+    t.add_column("#"); t.add_column("Имя"); t.add_column("Сервер"); t.add_column("Путь")
+    for i, (name, data) in enumerate(sessions.items(), 1):
+        t.add_row(str(i), name, f"{data['user']}@{data['host']}", data.get("cwd", "/"))
+    console.print(t)
+    try:
+        idx = int(Prompt.ask("Номер сессии")) - 1
+        name = list(sessions.keys())[idx]
+        data = sessions[name]
+        servers = load_servers()
+        for s in servers:
+            if s["host"] == data["host"] and s["user"] == data["user"]:
+                s["session_cwd"] = data["cwd"]
+                return s
+        console.print("[red]Сервер для сессии не найден[/red]")
+    except:
+        console.print("[red]Ошибка выбора сессии[/red]")
+    return None
+
 def main_menu():
     console.print(f"[red]🚀 SSHSCRE {VERSION} — замена Termius (консоль)[/red]")
-    console.print("[dim]→ Создатель: KilixKilik | GitHub: @KilixKilik[/dim]\n")  # 👈 ДОБАВИЛ СТРОКУ СОЗДАТЕЛЯ
+    console.print("[dim]→ Создатель: KilixKilik | GitHub: @KilixKilik[/dim]\n")
+
     while True:
-        console.print("\n[bold]Меню:[/bold]\n1. Подключиться\n2. Добавить\n3. Список\n4. Выход")
-        choice = Prompt.ask("→", choices=["1", "2", "3", "4"])
+        console.print("\n[bold]Меню:[/bold]\n1. Подключиться\n2. Восстановить сессию\n3. Добавить\n4. Список\n5. Выход")
+        choice = Prompt.ask("→", choices=["1", "2", "3", "4", "5"])
         if choice == "1":
             servers = load_servers()
             if not servers: console.print("[red]Добавьте сервер[/red]"); continue
@@ -238,9 +302,12 @@ def main_menu():
                 if 0 <= idx < len(servers): connect_to_server(servers[idx])
                 else: console.print("[red]Неверный номер[/red]")
             except: console.print("[red]Введите число[/red]")
-        elif choice == "2": add_server()
-        elif choice == "3": list_servers()
-        elif choice == "4": console.print("[red]👋 Пока[/red]"); break
+        elif choice == "2":
+            server = restore_session()
+            if server: connect_to_server(server)
+        elif choice == "3": add_server()
+        elif choice == "4": list_servers()
+        elif choice == "5": console.print("[red]👋 Пока[/red]"); break
 
 if __name__ == "__main__":
     main_menu()
