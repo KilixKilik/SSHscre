@@ -41,10 +41,15 @@ def inject_sysinfo():
     print(f"\033[94m{info}\033[0m")
 
 if __name__ == "__main__":
-    log("=== ЗАПУСК В РЕЖИМЕ ОТЛАДКИ ===", "BOOT")
+    VERSION = "v0.1.2"
+    log(f"=== ЗАПУСК SSHSCRE {VERSION} В РЕЖИМЕ ОТЛАДКИ ===", "BOOT")
     log(f"Python {sys.version}", "ENV")
     log(f"Рабочая директория: {os.getcwd()}", "ENV")
 
+    if not os.path.exists("sshscree.py"):
+        log("❌ ОШИБКА: файл sshscree.py не найден", "CRASH")
+        sys.exit(1)
+    
     try:
         from rich.prompt import Prompt
         _original_ask = Prompt.ask
@@ -57,14 +62,33 @@ if __name__ == "__main__":
         start_time = time.time()
         log("Запуск SSHscre...", "BOOT")
 
-        import main 
-        if hasattr(main, 'main_menu'):
+        import sshscree
+        if hasattr(sshscree, 'main_menu'):
             inject_sysinfo()
-            main.main_menu()
+            log("✅ Основной модуль импортирован", "BOOT")
+            if os.path.exists("servers.db"):
+                import sqlite3
+                conn = sqlite3.connect("servers.db")
+                c = conn.cursor()
+                c.execute("PRAGMA table_info(servers)")
+                servers_cols = [col[1] for col in c.fetchall()]
+                c.execute("PRAGMA table_info(sessions)")
+                sessions_cols = [col[1] for col in c.fetchall()]
+                conn.close()
+                
+                log(f"Структура БД servers: {', '.join(servers_cols)}", "DB")
+                log(f"Структура БД sessions: {', '.join(sessions_cols)}", "DB")
+                if os.path.exists("UpdateSQL.py"):
+                    log("✅ UpdateSQL.py найден", "DB")
+                else:
+                    log("⚠️ UpdateSQL.py не найден", "DB")
+            else:
+                log("⚠️ База данных servers.db не найдена", "DB")
+            
+            sshscree.main_menu()
         else:
-            log("main_menu не найден. Запускаю как модуль.", "WARN")
-            inject_sysinfo()
-            exec(open("main.py").read())
+            log("❌ main_menu не найден в sshscree.py", "CRASH")
+            sys.exit(1)
 
         duration = time.time() - start_time
         log(f"Сессия завершена. Работал {duration:.2f} сек.", "EXIT")
